@@ -319,6 +319,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # repeat to align with repeated responses in rollout
         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
         batch = batch.union(gen_batch_output)
+        print(
+            f"[train] rollout_done step={self.global_steps} batch_size={len(batch)}",
+            flush=True,
+        )
 
         if "response_mask" not in batch.batch.keys():
             batch.batch["response_mask"] = compute_response_mask(batch)
@@ -350,7 +354,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         with marked_timer("old_log_prob", timing_raw, color="blue"):
 
             def compute_old_log_prob(batch):
-                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                print(
+                    f"[train] actor_log_prob start step={self.global_steps} batch_size={len(batch)}",
+                    flush=True,
+                )
+                old_log_prob, _ = self._compute_old_log_prob(batch)
+                print(
+                    f"[train] actor_log_prob done step={self.global_steps} batch_size={len(batch)}",
+                    flush=True,
+                )
                 entropys = old_log_prob.batch["entropys"]
                 response_masks = batch.batch["response_mask"]
                 actor_config = self.config.actor_rollout_ref.actor
@@ -396,16 +408,29 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         if self.use_reference_policy:
             # compute reference log_prob
             with marked_timer("ref", timing_raw, color="olive"):
-                if not self.ref_in_actor:
-                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                else:
-                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                print(
+                    f"[train] ref_log_prob start step={self.global_steps} batch_size={len(batch)}",
+                    flush=True,
+                )
+                ref_log_prob = self._compute_ref_log_prob(batch)
+                print(
+                    f"[train] ref_log_prob done step={self.global_steps} batch_size={len(batch)}",
+                    flush=True,
+                )
                 batch = batch.union(ref_log_prob)
 
         # compute values
         if self.use_critic:
             with marked_timer("values", timing_raw, color="cyan"):
-                values = self.critic_wg.compute_values(batch)
+                print(
+                    f"[train] critic_values start step={self.global_steps} batch_size={len(batch)}",
+                    flush=True,
+                )
+                values = self._compute_values(batch)
+                print(
+                    f"[train] critic_values done step={self.global_steps} batch_size={len(batch)}",
+                    flush=True,
+                )
                 batch = batch.union(values)
 
         with marked_timer("adv", timing_raw, color="brown"):
@@ -456,7 +481,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # update critic
         if self.use_critic:
             with marked_timer("update_critic", timing_raw, color="pink"):
-                critic_output = self.critic_wg.update_critic(batch)
+                print(
+                    f"[train] update_critic start step={self.global_steps} batch_size={len(batch)}",
+                    flush=True,
+                )
+                critic_output = self._update_critic(batch)
+                print(
+                    f"[train] update_critic done step={self.global_steps} batch_size={len(batch)}",
+                    flush=True,
+                )
             critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
             metrics.update(critic_output_metrics)
 
@@ -464,8 +497,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         if self.config.trainer.critic_warmup <= self.global_steps:
             # update actor
             with marked_timer("update_actor", timing_raw, color="red"):
-                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                actor_output = self.actor_rollout_wg.update_actor(batch)
+                print(
+                    f"[train] update_actor start step={self.global_steps} batch_size={len(batch)}",
+                    flush=True,
+                )
+                actor_output = self._update_actor(batch)
+                print(
+                    f"[train] update_actor done step={self.global_steps} batch_size={len(batch)}",
+                    flush=True,
+                )
             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
             metrics.update(actor_output_metrics)
         return batch, reward_extra_infos_dict

@@ -222,6 +222,68 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    # Rollout-level reward metrics (group by episode_index + rollout_id)
+    if "episode_index" in batch.non_tensor_batch and "rollout_id" in batch.non_tensor_batch:
+        episode_index = np.array(batch.non_tensor_batch["episode_index"])
+        rollout_id = np.array(batch.non_tensor_batch["rollout_id"])
+        non_aborted_mask_np = non_aborted_mask.detach().cpu().numpy()
+        episode_index = episode_index[non_aborted_mask_np]
+        rollout_id = rollout_id[non_aborted_mask_np]
+        rollout_rewards = non_aborted_sequence_reward.detach().cpu().numpy()
+        if episode_index.size and rollout_id.size and rollout_rewards.size:
+            rollout_to_rewards: dict[Any, list[float]] = defaultdict(list)
+            for ep, rid, r in zip(episode_index.tolist(), rollout_id.tolist(), rollout_rewards.tolist()):
+                rollout_to_rewards[(ep, rid)].append(float(r))
+            per_rollout_reward = np.array(
+                [float(np.mean(rs)) for rs in rollout_to_rewards.values()], dtype=np.float32
+            )
+            if per_rollout_reward.size:
+                metrics["rollout/reward/mean"] = float(per_rollout_reward.mean())
+                metrics["rollout/reward/max"] = float(per_rollout_reward.max())
+                metrics["rollout/reward/min"] = float(per_rollout_reward.min())
+                metrics["rollout/reward/count"] = int(per_rollout_reward.size)
+
+    if "format_penalty" in batch.non_tensor_batch:
+        format_penalties = []
+        for value in batch.non_tensor_batch["format_penalty"]:
+            if value is None:
+                continue
+            try:
+                format_penalties.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        if format_penalties:
+            penalties = np.array(format_penalties, dtype=np.float32)
+            metrics["router/format_penalty/min"] = float(penalties.min())
+            metrics["router/format_penalty/mean"] = float(penalties.mean())
+            metrics["router/format_penalty/max"] = float(penalties.max())
+
+    success_key = None
+    if "verify_success" in batch.non_tensor_batch:
+        success_key = "verify_success"
+    elif "judge_success" in batch.non_tensor_batch:
+        success_key = "judge_success"
+    if success_key:
+        success_values = []
+        for value in batch.non_tensor_batch[success_key]:
+            if value is None:
+                continue
+            success_values.append(bool(value))
+        if success_values:
+            metrics["router/success_rate"] = float(np.mean(success_values))
+
+    if "effort" in batch.non_tensor_batch:
+        counts = {"low": 0, "medium": 0, "high": 0}
+        total = 0
+        for value in batch.non_tensor_batch["effort"]:
+            if value in counts:
+                counts[value] += 1
+                total += 1
+        if total:
+            metrics["router/effort_ratio_low"] = counts["low"] / total
+            metrics["router/effort_ratio_medium"] = counts["medium"] / total
+            metrics["router/effort_ratio_high"] = counts["high"] / total
+
     return metrics
 
 

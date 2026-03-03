@@ -49,6 +49,27 @@ def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, 
     for key, val in metrics.items():
         if isinstance(val, Metric):
             metrics[key] = val.aggregate()
+            continue
+        if isinstance(val, list):
+            # Flatten ragged metric lists (e.g., per-rank lists of per-microbatch values).
+            flat_vals: list[Any] = []
+            for item in val:
+                if isinstance(item, Metric):
+                    flat_vals.extend(item.values)
+                elif isinstance(item, list):
+                    flat_vals.extend(item)
+                elif isinstance(item, tuple):
+                    flat_vals.extend(item)
+                elif isinstance(item, np.ndarray):
+                    flat_vals.extend(item.reshape(-1).tolist())
+                elif isinstance(item, torch.Tensor):
+                    if item.numel() == 1:
+                        flat_vals.append(item.detach().item())
+                    else:
+                        flat_vals.extend(item.detach().reshape(-1).tolist())
+                else:
+                    flat_vals.append(item)
+            val = flat_vals
         elif "max" in key:
             metrics[key] = np.max(val)
         elif "min" in key:

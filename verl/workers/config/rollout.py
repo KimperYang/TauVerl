@@ -50,6 +50,8 @@ class MultiTurnConfig(BaseConfig):
     max_assistant_turns: Optional[int] = None
     tool_config_path: Optional[str] = None
     max_user_turns: Optional[int] = None
+    # Drop failed samples instead of raising in multi-turn rollouts.
+    drop_failed_samples: bool = False
     max_parallel_calls: int = 1
     max_tool_response_length: int = 256
     tool_response_truncate_side: str = "middle"

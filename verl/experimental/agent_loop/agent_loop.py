@@ -13,9 +13,12 @@
 # limitations under the License.
 import asyncio
 import heapq
+import json
 import logging
 import os
 import random
+import sys
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -401,6 +404,66 @@ class AgentLoopWorker:
             trace_config.get("max_samples_per_step_per_worker", None),
         )
 
+    def _zero_response_mask_debug_path(self) -> str:
+        debug_root = None
+        try:
+            debug_root = self.config.trainer.get("default_local_dir")
+        except Exception:
+            debug_root = None
+        if not debug_root:
+            debug_root = "/tmp"
+        debug_dir = os.path.join(debug_root, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        return os.path.join(debug_dir, "zero_response_mask.jsonl")
+
+    def _log_zero_response_mask(
+        self,
+        *,
+        output: "AgentLoopOutput",
+        response_output: dict[str, torch.Tensor],
+        response_mask_output: dict[str, torch.Tensor],
+        response_mask: torch.Tensor,
+        **kwargs,
+    ) -> None:
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        response_ids = list(output.response_ids)
+        prompt_ids = list(output.prompt_ids)
+        record = {
+            "ts": time.time(),
+            "pid": os.getpid(),
+            "uid": kwargs.get("uid"),
+            "index": kwargs.get("index"),
+            "agent_name": kwargs.get("agent_name"),
+            "turn_index": output.extra_fields.get("turn_index"),
+            "prompt_len": len(prompt_ids),
+            "response_len": len(response_ids),
+            "prompt_ids_head": prompt_ids[:16],
+            "prompt_ids_tail": prompt_ids[-16:] if prompt_ids else [],
+            "response_ids_head": response_ids[:16],
+            "response_ids_tail": response_ids[-16:] if response_ids else [],
+            "response_mask_raw_sum": int(response_mask_output["input_ids"].sum().item()),
+            "response_attention_sum": int(response_output["attention_mask"].sum().item()),
+            "response_mask_final_sum": int(response_mask.sum().item()),
+            "pad_token_id": pad_token_id,
+            "eos_token_id": eos_token_id,
+            "response_input_ids_head": response_output["input_ids"][0][:16].tolist(),
+            "response_input_ids_tail": response_output["input_ids"][0][-16:].tolist(),
+            "response_attention_head": response_output["attention_mask"][0][:16].tolist(),
+            "response_attention_tail": response_output["attention_mask"][0][-16:].tolist(),
+            "prompt_length_cfg": self.config.actor_rollout_ref.rollout.prompt_length,
+            "response_length_cfg": self.config.actor_rollout_ref.rollout.response_length,
+        }
+        try:
+            path = self._zero_response_mask_debug_path()
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as exc:
+            print(
+                f"[agent_loop_debug] failed to write zero response_mask log: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -580,6 +643,14 @@ class AgentLoopWorker:
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
+        if int(response_mask.sum().item()) == 0:
+            self._log_zero_response_mask(
+                output=output,
+                response_output=response_output,
+                response_mask_output=response_mask_output,
+                response_mask=response_mask,
+                **kwargs,
+            )
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
 

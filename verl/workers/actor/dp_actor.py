@@ -17,8 +17,11 @@
 Single Process Actor
 """
 
+import json
 import logging
 import os
+import sys
+import time
 
 import torch
 from torch import nn
@@ -559,13 +562,22 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for micro_batch_idx, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
+                    has_valid_tokens = bool(response_mask.any().item())
+                    if not has_valid_tokens:
+                        self._log_zero_response_mask(
+                            data=micro_batch,
+                            response_mask=response_mask,
+                            responses=model_inputs.get("responses"),
+                            batch_idx=batch_idx,
+                            micro_batch_idx=micro_batch_idx,
+                        )
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
@@ -583,6 +595,15 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
+
+                    if not has_valid_tokens:
+                        # No valid tokens in this micro-batch (padding-only); skip metrics and loss.
+                        dummy_loss = log_prob.sum() * 0.0
+                        if self.scaler is not None:
+                            self.scaler.scale(dummy_loss).backward()
+                        else:
+                            dummy_loss.backward()
+                        continue
 
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -667,3 +688,45 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
+
+    def _log_zero_response_mask(
+        self,
+        *,
+        data: DataProto,
+        response_mask: torch.Tensor,
+        responses: torch.Tensor | None,
+        batch_idx: int,
+        micro_batch_idx: int,
+    ) -> None:
+        debug_dir = data.meta_info.get("debug_dir") or os.getenv("VERL_DEBUG_DIR") or "/tmp"
+        os.makedirs(debug_dir, exist_ok=True)
+        log_path = os.path.join(debug_dir, "zero_response_mask_actor.jsonl")
+        response_mask_sum = response_mask.detach().sum(dim=-1).to("cpu").tolist()
+        response_ids_head = []
+        response_ids_tail = []
+        if responses is not None:
+            responses_cpu = responses.detach().to("cpu")
+            for i in range(responses_cpu.shape[0]):
+                response_ids_head.append(responses_cpu[i, :16].tolist())
+                response_ids_tail.append(responses_cpu[i, -16:].tolist())
+        record = {
+            "ts": time.time(),
+            "pid": os.getpid(),
+            "global_steps": data.meta_info.get("global_steps"),
+            "batch_idx": batch_idx,
+            "micro_batch_idx": micro_batch_idx,
+            "micro_batch_size": int(response_mask.shape[0]),
+            "response_mask_sum": response_mask_sum,
+            "response_ids_head": response_ids_head,
+            "response_ids_tail": response_ids_tail,
+            "response_mask_shape": list(response_mask.shape),
+            "responses_shape": list(responses.shape) if responses is not None else None,
+        }
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=True) + "\n")
+        except Exception as exc:
+            print(
+                f"[actor_debug] failed to write zero response_mask log: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )

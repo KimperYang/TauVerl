@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import csv
 import json
 import os
 import uuid
@@ -1140,6 +1141,39 @@ class RayPPOTrainer:
             dp_rank_mapping = worker_group._dispatch_info[role]
         return max(dp_rank_mapping) + 1
 
+    def _get_dp_infer_chunk_size(self, default: int = 32) -> int:
+        env_value = os.getenv("VERL_DP_INFER_CHUNK_SIZE")
+        if env_value is None:
+            env_value = self.config.trainer.get("dp_infer_chunk_size", default)
+        try:
+            chunk_size = int(env_value)
+        except (TypeError, ValueError):
+            chunk_size = default
+        if chunk_size <= 0:
+            chunk_size = default
+        return chunk_size
+
+    def _pad_batch_for_dp_update(self, batch: DataProto, dp_size: int) -> tuple[DataProto, int]:
+        if dp_size <= 0:
+            return batch, 0
+        pad_size = (-len(batch)) % dp_size
+        if pad_size == 0:
+            return batch, 0
+        orig_len = len(batch)
+        padding_part = batch.slice(orig_len - 1, orig_len).repeat(pad_size, interleave=True)
+        padded = DataProto.concat([batch, padding_part])
+        if padded.batch is not None and "response_mask" in padded.batch:
+            padded.batch["response_mask"][orig_len:] = 0
+        for key in ("advantages", "returns", "values", "token_level_rewards", "token_level_scores"):
+            if padded.batch is not None and key in padded.batch:
+                padded.batch[key][orig_len:] = 0
+        if "global_token_num" in padded.meta_info:
+            base_tokens = list(batch.meta_info.get("global_token_num", []))
+            padded.meta_info["global_token_num"] = base_tokens + [0] * pad_size
+        if "images_seqlens" in padded.meta_info:
+            padded.meta_info["images_seqlens"] = list(batch.meta_info.get("images_seqlens", []))
+        return padded, pad_size
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens.
 
@@ -1210,7 +1244,7 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
-    def _compute_values(self, batch: DataProto) -> DataProto:
+    def _compute_values_single(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to nopadding
@@ -1227,7 +1261,20 @@ class RayPPOTrainer:
             values = self.critic_wg.compute_values(batch)
         return values
 
-    def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+    def _compute_values(self, batch: DataProto) -> DataProto:
+        chunk_size = self._get_dp_infer_chunk_size()
+        dp_size = self._get_dp_size(self.critic_wg, "critic")
+        outputs = []
+        for chunk in batch.split(chunk_size):
+            padded_chunk, pad_size = pad_dataproto_to_divisor(chunk, dp_size)
+            values = self._compute_values_single(padded_chunk)
+            values = unpad_dataproto(values, pad_size=pad_size)
+            outputs.append(values)
+        if not outputs:
+            return DataProto()
+        return DataProto.concat(outputs)
+
+    def _compute_ref_log_prob_single(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
             # step 1: convert dataproto to tensordict.
             batch_td = batch.to_tensordict()
@@ -1254,7 +1301,35 @@ class RayPPOTrainer:
 
         return ref_log_prob
 
-    def _compute_old_log_prob(self, batch: DataProto):
+    def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+        chunk_size = self._get_dp_infer_chunk_size()
+        if self.ref_in_actor:
+            dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        else:
+            mesh_name = getattr(self, "_ref_dp_mesh_name", None)
+            if mesh_name is None:
+                for candidate in ("actor", "ref"):
+                    try:
+                        dp_size = self._get_dp_size(self.ref_policy_wg, candidate)
+                        self._ref_dp_mesh_name = candidate
+                        break
+                    except Exception:
+                        dp_size = None
+                if dp_size is None:
+                    dp_size = self.ref_policy_wg.world_size
+            else:
+                dp_size = self._get_dp_size(self.ref_policy_wg, mesh_name)
+        outputs = []
+        for chunk in batch.split(chunk_size):
+            padded_chunk, pad_size = pad_dataproto_to_divisor(chunk, dp_size)
+            ref_log_prob = self._compute_ref_log_prob_single(padded_chunk)
+            ref_log_prob = unpad_dataproto(ref_log_prob, pad_size=pad_size)
+            outputs.append(ref_log_prob)
+        if not outputs:
+            return DataProto()
+        return DataProto.concat(outputs)
+
+    def _compute_old_log_prob_single(self, batch: DataProto):
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
@@ -1279,14 +1354,40 @@ class RayPPOTrainer:
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
+    def _compute_old_log_prob(self, batch: DataProto):
+        chunk_size = self._get_dp_infer_chunk_size()
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        outputs = []
+        mfu_weighted = 0.0
+        mfu_total = 0
+        for chunk in batch.split(chunk_size):
+            padded_chunk, pad_size = pad_dataproto_to_divisor(chunk, dp_size)
+            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob_single(padded_chunk)
+            old_log_prob = unpad_dataproto(old_log_prob, pad_size=pad_size)
+            outputs.append(old_log_prob)
+            if old_log_prob_mfu is not None:
+                mfu_weighted += float(old_log_prob_mfu) * len(chunk)
+                mfu_total += len(chunk)
+        if not outputs:
+            return DataProto(), 0
+        combined = DataProto.concat(outputs)
+        avg_mfu = mfu_weighted / mfu_total if mfu_total else 0
+        return combined, avg_mfu
+
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+        batch.meta_info.setdefault(
+            "debug_dir",
+            os.path.join(self.config.trainer.default_local_dir, "debug"),
+        )
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        update_batch, pad_size = self._pad_batch_for_dp_update(batch, dp_size)
         # update actor
         if self.use_legacy_worker_impl == "disable":
-            batch_td = batch.to_tensordict()
+            batch_td = update_batch.to_tensordict()
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
@@ -1312,12 +1413,16 @@ class RayPPOTrainer:
             actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
             actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
         else:
-            actor_output = self.actor_rollout_wg.update_actor(batch)
+            actor_output = self.actor_rollout_wg.update_actor(update_batch)
+            if pad_size and actor_output.batch is not None:
+                actor_output = unpad_dataproto(actor_output, pad_size=pad_size)
         return actor_output
 
     def _update_critic(self, batch: DataProto) -> DataProto:
+        dp_size = self._get_dp_size(self.critic_wg, "critic")
+        update_batch, pad_size = self._pad_batch_for_dp_update(batch, dp_size)
         if self.use_legacy_worker_impl == "disable":
-            batch_td = batch.to_tensordict()
+            batch_td = update_batch.to_tensordict()
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
             ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
@@ -1342,7 +1447,9 @@ class RayPPOTrainer:
             output["perf/mfu/critic"] = output.pop("critic/mfu")
             critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
         else:
-            critic_output = self.critic_wg.update_critic(batch)
+            critic_output = self.critic_wg.update_critic(update_batch)
+            if pad_size and critic_output.batch is not None:
+                critic_output = unpad_dataproto(critic_output, pad_size=pad_size)
         return critic_output
 
     def fit(self):
@@ -1362,6 +1469,89 @@ class RayPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+
+        prompt_success_table = None
+        prompt_success_csv = None
+        prompt_success_csv_has_header = False
+
+        def _update_prompt_success(batch: DataProto, acc: dict):
+            if "episode_index" not in batch.non_tensor_batch:
+                return
+            success_key = None
+            if "verify_success" in batch.non_tensor_batch:
+                success_key = "verify_success"
+            elif "judge_success" in batch.non_tensor_batch:
+                success_key = "judge_success"
+            if success_key is None:
+                return
+            episode_index = batch.non_tensor_batch["episode_index"]
+            success_vals = batch.non_tensor_batch[success_key]
+            rollout_id = batch.non_tensor_batch.get("rollout_id")
+            seen = set()
+            for i, success in enumerate(success_vals):
+                if success is None:
+                    continue
+                if rollout_id is not None:
+                    key = (episode_index[i], rollout_id[i])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                acc[episode_index[i]][1] += 1
+                if bool(success):
+                    acc[episode_index[i]][0] += 1
+
+        def _log_prompt_success(epoch: int, acc: dict):
+            nonlocal prompt_success_table
+            nonlocal prompt_success_csv
+            nonlocal prompt_success_csv_has_header
+            wandb = logger.logger.get("wandb") if hasattr(logger, "logger") else None
+            if wandb is None or wandb.run is None or not acc:
+                # Still write local CSV even if wandb is not available.
+                pass
+            columns = ["epoch", "prompt_id", "success_rate", "success", "total", "global_step"]
+            if wandb is not None and wandb.run is not None:
+                if prompt_success_table is None:
+                    prompt_success_table = wandb.Table(columns=columns)
+                # Workaround for wandb table append
+                new_table = wandb.Table(columns=columns, data=prompt_success_table.data)
+                for prompt_id, (succ, total) in acc.items():
+                    if total <= 0:
+                        continue
+                    new_table.add_data(
+                        int(epoch),
+                        str(prompt_id),
+                        float(succ) / float(total),
+                        int(succ),
+                        int(total),
+                        int(self.global_steps),
+                    )
+                wandb.log({"train/prompt_success": new_table}, step=self.global_steps)
+                prompt_success_table = new_table
+
+            # Local CSV logging
+            if prompt_success_csv is None:
+                base_dir = self.config.trainer.get("default_local_dir", None) or os.path.join(os.getcwd(), "outputs")
+                os.makedirs(base_dir, exist_ok=True)
+                prompt_success_csv = os.path.join(base_dir, "prompt_success.csv")
+                prompt_success_csv_has_header = os.path.exists(prompt_success_csv)
+            with open(prompt_success_csv, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if not prompt_success_csv_has_header:
+                    writer.writerow(columns)
+                    prompt_success_csv_has_header = True
+                for prompt_id, (succ, total) in acc.items():
+                    if total <= 0:
+                        continue
+                    writer.writerow(
+                        [
+                            int(epoch),
+                            str(prompt_id),
+                            float(succ) / float(total),
+                            int(succ),
+                            int(total),
+                            int(self.global_steps),
+                        ]
+                    )
 
         self.global_steps = 0
 
@@ -1401,6 +1591,7 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            prompt_success_acc = defaultdict(lambda: [0, 0])
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -1416,10 +1607,15 @@ class RayPPOTrainer:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
-                # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                )
+                # add uid to batch (use stable prompt index when available)
+                if "index" in batch.non_tensor_batch:
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [str(idx) for idx in batch.non_tensor_batch["index"]], dtype=object
+                    )
+                else:
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    )
 
                 gen_batch = self._get_gen_batch(batch)
 
@@ -1478,7 +1674,15 @@ class RayPPOTrainer:
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    if batch.batch.batch_size[0] != gen_batch_output.batch.batch_size[0]:
+                        # Multi-turn flatten can change batch size; use turn-level batch directly.
+                        batch = gen_batch_output
+                    else:
+                        batch = batch.union(gen_batch_output)
+                    print(
+                        f"[train] rollout_done step={self.global_steps} batch_size={len(batch)}",
+                        flush=True,
+                    )
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1534,7 +1738,15 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            print(
+                                f"[train] actor_log_prob start step={self.global_steps} batch_size={len(batch)}",
+                                flush=True,
+                            )
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            print(
+                                f"[train] actor_log_prob done step={self.global_steps} batch_size={len(batch)}",
+                                flush=True,
+                            )
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1562,13 +1774,29 @@ class RayPPOTrainer:
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            print(
+                                f"[train] ref_log_prob start step={self.global_steps} batch_size={len(batch)}",
+                                flush=True,
+                            )
                             ref_log_prob = self._compute_ref_log_prob(batch)
+                            print(
+                                f"[train] ref_log_prob done step={self.global_steps} batch_size={len(batch)}",
+                                flush=True,
+                            )
                             batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
+                            print(
+                                f"[train] critic_values start step={self.global_steps} batch_size={len(batch)}",
+                                flush=True,
+                            )
                             values = self._compute_values(batch)
+                            print(
+                                f"[train] critic_values done step={self.global_steps} batch_size={len(batch)}",
+                                flush=True,
+                            )
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
@@ -1623,7 +1851,15 @@ class RayPPOTrainer:
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
+                            print(
+                                f"[train] update_critic start step={self.global_steps} batch_size={len(batch)}",
+                                flush=True,
+                            )
                             critic_output = self._update_critic(batch)
+                            print(
+                                f"[train] update_critic done step={self.global_steps} batch_size={len(batch)}",
+                                flush=True,
+                            )
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
@@ -1631,7 +1867,15 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
+                            print(
+                                f"[train] update_actor start step={self.global_steps} batch_size={len(batch)}",
+                                flush=True,
+                            )
                             actor_output = self._update_actor(batch)
+                            print(
+                                f"[train] update_actor done step={self.global_steps} batch_size={len(batch)}",
+                                flush=True,
+                            )
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -1705,6 +1949,9 @@ class RayPPOTrainer:
                 # compute variance proxy metrics
                 gradient_norm = metrics.get("actor/grad_norm", None)
                 metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+
+                # accumulate per-prompt success for epoch-level logging
+                _update_prompt_success(batch, prompt_success_acc)
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
@@ -1726,6 +1973,7 @@ class RayPPOTrainer:
                     )
 
                 if is_last_step:
+                    _log_prompt_success(epoch, prompt_success_acc)
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
@@ -1737,3 +1985,6 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+            # end of epoch: log per-prompt success table
+            _log_prompt_success(epoch, prompt_success_acc)
